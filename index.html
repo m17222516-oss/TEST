@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>فحص تغطية آفاق الفكر</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin:0; font-family: Tahoma, Arial, sans-serif; background:#f6f7f9; color:#111827; }
+    .top { padding:14px 18px; background:#111827; color:white; font-weight:bold; }
+    .wrap { display:grid; grid-template-columns: 390px 1fr; min-height: calc(100vh - 52px); }
+    .panel { padding:16px; background:white; box-shadow:0 0 12px #0002; z-index:2; }
+    #map { height: calc(100vh - 52px); }
+    button { width:100%; padding:12px; margin:8px 0; border:0; border-radius:10px; cursor:pointer; font-size:16px; background:#2563eb; color:white; }
+    button.secondary { background:#374151; }
+    input { width:100%; box-sizing:border-box; padding:12px; margin:8px 0; border:1px solid #ddd; border-radius:8px; font-size:15px; }
+    .result { margin-top:12px; padding:12px; border-radius:10px; background:#f3f4f6; line-height:1.8; }
+    .ok { background:#dcfce7; color:#14532d; }
+    .bad { background:#fee2e2; color:#7f1d1d; }
+    .wait { background:#e0f2fe; color:#075985; }
+    .hide { display:none; }
+    small { color:#666; }
+    .hint { font-size:14px; color:#555; line-height:1.7; }
+    @media(max-width:800px) { .wrap { grid-template-columns:1fr; } #map { height:55vh; } }
+  </style>
+</head>
+<body>
+  <div class="top">فحص تغطية الإنترنت - آفاق الفكر</div>
+  <div class="wrap">
+    <div class="panel">
+      <h2>فحص التغطية</h2>
+      <p class="hint">اضغط على زر تحديد موقعي. بالخطة النهائية العميل لا يشوف الزونات، فقط يشوف النتيجة.</p>
+      <button onclick="locateMe()">📍 حدد موقعي</button>
+      <button class="secondary" onclick="clearResult()">مسح النتيجة</button>
+      <div id="result" class="result wait">جاري تحميل ملف الزونات...</div>
+
+      <div id="formBox" class="hide">
+        <h3>طلب اشتراك</h3>
+        <input id="name" placeholder="اسم العميل" />
+        <input id="phone" placeholder="رقم الهاتف" inputmode="tel" />
+        <button onclick="submitRequest()">إرسال الطلب التجريبي</button>
+        <small>حاليًا تجريبي. لاحقًا نفس البيانات تنرسل إلى Odoo.</small>
+      </div>
+
+      <pre id="payload" style="white-space:pre-wrap;background:#111827;color:#e5e7eb;padding:10px;border-radius:8px;direction:ltr;text-align:left;display:none"></pre>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+  <script>
+    const map = L.map('map').setView([32.60210106705336, 44.059584233064854], 13);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let zones = null;
+    let userMarker = null;
+    let matchedZone = null;
+    let lastLatLng = null;
+
+    // نحمّل ملف الزونات فقط للفحص، ولا نرسمه على الخريطة حتى لا يراه العميل
+    fetch('./zones.geojson', { cache: 'no-store' })
+      .then(response => {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.json();
+      })
+      .then(data => {
+        zones = data;
+        showNeutral('✅ تم تحميل بيانات التغطية. اضغط "حدد موقعي" للفحص.');
+      })
+      .catch(error => {
+        console.error('Zones loading error:', error);
+        showBad('❌ لم يكتمل تحميل ملف الزونات. تأكد أن ملف zones.geojson مرفوع بنفس مكان index.html.');
+      });
+
+    function locateMe() {
+      clearResult(false);
+      if (!navigator.geolocation) {
+        showBad('المتصفح لا يدعم تحديد الموقع.');
+        return;
+      }
+      if (!zones) {
+        showBad('ملف الزونات لم يكتمل تحميله بعد. انتظر أو تأكد من رفع zones.geojson.');
+        return;
+      }
+      showNeutral('جاري تحديد موقعك...');
+      navigator.geolocation.getCurrentPosition(
+        pos => checkCoverage(pos.coords.latitude, pos.coords.longitude),
+        err => showBad('لم يتم السماح بتحديد الموقع أو حدث خطأ. افتح صلاحية الموقع من المتصفح.')
+      );
+    }
+
+    // للاختبار الداخلي فقط: الضغط على الخريطة يفحص نقطة، العميل النهائي ممكن نعطله
+    map.on('click', e => {
+      if (!zones) { showBad('ملف الزونات لم يكتمل تحميله بعد.'); return; }
+      checkCoverage(e.latlng.lat, e.latlng.lng);
+    });
+
+    function checkCoverage(lat, lng) {
+      lastLatLng = { lat, lng };
+      matchedZone = null;
+
+      if (userMarker) map.removeLayer(userMarker);
+      userMarker = L.marker([lat, lng]).addTo(map).bindPopup('موقعك').openPopup();
+      map.setView([lat, lng], 16);
+
+      const point = turf.point([lng, lat]);
+
+      for (const zone of zones.features) {
+        if (zone.geometry && (zone.geometry.type === 'Polygon' || zone.geometry.type === 'MultiPolygon')) {
+          if (turf.booleanPointInPolygon(point, zone)) {
+            matchedZone = zone;
+            break;
+          }
+        }
+      }
+
+      if (matchedZone) {
+        const p = matchedZone.properties || {};
+        const zoneName = p.name || p.Name || p.ZoneID || p.id || 'Zone';
+        document.getElementById('result').className = 'result ok';
+        document.getElementById('result').innerHTML = `✅ موقعك داخل منطقة التغطية<br><b>يمكنك الآن تقديم طلب اشتراك.</b>`;
+        document.getElementById('formBox').classList.remove('hide');
+      } else {
+        showBad('❌ موقعك خارج التغطية حاليًا.');
+        document.getElementById('formBox').classList.add('hide');
+      }
+    }
+
+    function showNeutral(message) {
+      document.getElementById('result').className = 'result wait';
+      document.getElementById('result').innerHTML = message;
+    }
+
+    function showBad(message) {
+      document.getElementById('result').className = 'result bad';
+      document.getElementById('result').innerHTML = message;
+      document.getElementById('formBox').classList.add('hide');
+    }
+
+    function clearResult(resetText = true) {
+      matchedZone = null;
+      lastLatLng = null;
+      document.getElementById('formBox').classList.add('hide');
+      document.getElementById('payload').style.display = 'none';
+      document.getElementById('payload').textContent = '';
+      document.getElementById('name').value = '';
+      document.getElementById('phone').value = '';
+      if (userMarker) {
+        map.removeLayer(userMarker);
+        userMarker = null;
+      }
+      if (resetText) showNeutral(zones ? 'تم مسح النتيجة. اضغط "حدد موقعي" للفحص من جديد.' : 'جاري تحميل ملف الزونات...');
+    }
+
+    function submitRequest() {
+      const name = document.getElementById('name').value.trim();
+      const phone = document.getElementById('phone').value.trim();
+      if (!name || !phone) {
+        alert('اكتب الاسم ورقم الهاتف');
+        return;
+      }
+      if (!matchedZone || !lastLatLng) {
+        alert('لا توجد نتيجة تغطية صالحة. افحص الموقع أولًا.');
+        return;
+      }
+
+      const p = matchedZone.properties || {};
+      const payload = {
+        customer_name: name,
+        phone: phone,
+        latitude: lastLatLng.lat,
+        longitude: lastLatLng.lng,
+        zone_name: p.name || p.Name || p.ZoneID || p.id || null,
+        created_at: new Date().toISOString()
+      };
+
+      document.getElementById('payload').style.display = 'block';
+      document.getElementById('payload').textContent = JSON.stringify(payload, null, 2);
+      console.log('Subscription request payload:', payload);
+      alert('تم تجهيز الطلب التجريبي. لاحقًا نربطه بـ Odoo.');
+    }
+  </script>
+</body>
+</html>
